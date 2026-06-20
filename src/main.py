@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 import time
 from datetime import datetime, timezone
 
@@ -46,6 +47,15 @@ WATCHDOG_S = 60.0
 
 def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid() -> str:
+    """26-char Crockford ULID (the collector envelope requires event_id)."""
+    n = (int(time.time() * 1000) << 80) | secrets.randbits(80)
+    return "".join(reversed([_CROCKFORD[(n >> (5 * i)) & 0x1F] for i in range(26)]))
 
 
 # --- pure helpers (unit-tested) ---------------------------------------------
@@ -89,7 +99,7 @@ class Shim:
     def _envelope(self, event_type: str, target: str, *, verdict: str = "n_a",
                   payload: dict | None = None) -> dict:
         return {
-            "spec_version": "0.1", "timestamp": _ts(),
+            "spec_version": "0.1", "event_id": _ulid(), "timestamp": _ts(),
             "subject": {"correlation_ids": [target], "loop_target": target},
             "role": "system", "station": STATION, "operation": "observation",
             "event_type": event_type, "verdict": verdict, "payload": payload or {},
@@ -156,13 +166,17 @@ async def run() -> int:  # pragma: no cover — the live loop (needs substrate+d
         timeout_min=int(os.environ.get("LOOP_TIMEOUT_MIN", "60")),
     )
     shim = Shim(client, cfg)
-    await client.create_subscription({
+    sub = await client.create_subscription({
         "name": "loop-run-requests", "on": TRIGGER_EVENT,
         "where": "", "owner": SHIM_PRODUCER})
+    # The collector assigns the owner from the token (an emitter token → the
+    # producer name, ignoring the body owner). Consume SSE with the owner it
+    # actually used, so delivery matches regardless of token type.
+    owner = sub.get("owner") or SHIM_PRODUCER
     await shim._emit("shim.heartbeat", "improvement-loop-shim",
                      payload={"status": "started", "trigger": TRIGGER_EVENT})
     asyncio.create_task(shim.watchdog())
-    async for line in client.sse_lines(SHIM_PRODUCER):
+    async for line in client.sse_lines(owner):
         delta = client.parse_sse_event(line)
         if not delta:
             continue
