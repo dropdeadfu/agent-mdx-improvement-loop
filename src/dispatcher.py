@@ -20,10 +20,15 @@ from dataclasses import dataclass, field
 logger = logging.getLogger("improvement-loop-shim.dispatcher")
 
 # Env names passed straight through from the shim's environment to the runner
-# (the inherited access). Absent ones are simply skipped.
+# (the inherited access). Absent ones are simply skipped. Both credential
+# transports are forwarded: the fleet default is base64 OAuth creds
+# (ANTHROPIC_CREDENTIALS_B64) + base64 GitHub App PEM (GH_APP_PRIVATE_KEY_B64),
+# with the raw ANTHROPIC_API_KEY / GH_APP_PRIVATE_KEY_PEM as fallbacks — the
+# runner entrypoint accepts whichever is present.
 _PASSTHROUGH_ENV = (
-    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
-    "GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_PEM",
+    "ANTHROPIC_CREDENTIALS_B64", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "GH_APP_ID", "GH_APP_INSTALLATION_ID",
+    "GH_APP_PRIVATE_KEY_B64", "GH_APP_PRIVATE_KEY_PEM",
     "POLARIS_URL",
     "IMPROVEMENT_LOOP_SKILL_ID", "IMPROVEMENT_LOOP_SKILL_VERSION",
 )

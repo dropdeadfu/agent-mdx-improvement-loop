@@ -10,9 +10,11 @@
 # Expected argv (set by dispatcher.build_docker_run_argv):
 #   claude --print "/e1:improvement-loop <target>"
 #
-# Required env (passed through by the shim):
-#   ANTHROPIC_API_KEY            sk-ant-…           (the loop's LLM key)
-#   GH_APP_ID / GH_APP_INSTALLATION_ID / GH_APP_PRIVATE_KEY_PEM
+# Required env — credential shape matches the polaris fleet (cve-triage):
+#   ANTHROPIC_CREDENTIALS_B64    base64(credentials.json) OAuth creds (fleet
+#                                default) — or ANTHROPIC_API_KEY (sk-ant-api03-*)
+#   GH_APP_ID / GH_APP_INSTALLATION_ID
+#   GH_APP_PRIVATE_KEY_B64       base64(PEM) (fleet default) — or GH_APP_PRIVATE_KEY_PEM
 #   POLARIS_URL                  substrate base URL (emits + bundle pull)
 #   POLARIS_TOKEN                the runner's scoped read+emit token
 # Optional:
@@ -24,26 +26,67 @@ set -uo pipefail
 
 err() { echo "fatal: $*" >&2; exit 1; }
 
-: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY required}"
 : "${POLARIS_URL:?POLARIS_URL required}"
 : "${POLARIS_TOKEN:?POLARIS_TOKEN required}"
 : "${GH_APP_ID:?GH_APP_ID required}"
 : "${GH_APP_INSTALLATION_ID:?GH_APP_INSTALLATION_ID required}"
-: "${GH_APP_PRIVATE_KEY_PEM:?GH_APP_PRIVATE_KEY_PEM required}"
 
-mkdir -p /etc/polaris /app /root/.claude
+mkdir -p /etc/polaris /app /root/.claude /root/.config/github-app /root/.cache
 
 # --- skip claude onboarding / trust prompts (headless) -------------------
 cat > /root/.claude/config.json <<'JSON'
 { "hasCompletedOnboarding": true, "hasTrustDialogAccepted": true }
 JSON
 
+# --- Anthropic auth: OAuth credentials.json (fleet default) or raw API key -
+# The fleet ships OAuth creds as base64(credentials.json) in
+# ANTHROPIC_CREDENTIALS_B64 (same transport as polaris-agent-cve-triage); a raw
+# ANTHROPIC_API_KEY (sk-ant-api03-*) is the fallback.
+if [ -n "${ANTHROPIC_CREDENTIALS_B64:-}" ]; then
+    printf '%s' "$ANTHROPIC_CREDENTIALS_B64" | base64 -d > /root/.claude/.credentials.json \
+        || err "ANTHROPIC_CREDENTIALS_B64 is not valid base64"
+    chmod 0600 /root/.claude/.credentials.json
+    unset ANTHROPIC_CREDENTIALS_B64
+    python3 -c 'import json; json.load(open("/root/.claude/.credentials.json"))' \
+        || err "ANTHROPIC_CREDENTIALS_B64 did not decode to valid JSON"
+    echo "anthropic creds: materialised /root/.claude/.credentials.json"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "anthropic creds: using ANTHROPIC_API_KEY"
+else
+    err "ANTHROPIC_CREDENTIALS_B64 (base64 credentials.json) or ANTHROPIC_API_KEY required"
+fi
+
 # --- GitHub App: materialise PEM + wire the credential helper -----------
-printf '%s' "$GH_APP_PRIVATE_KEY_PEM" > /etc/polaris/gh-app.pem
-chmod 0600 /etc/polaris/gh-app.pem
-unset GH_APP_PRIVATE_KEY_PEM
-export GH_APP_PEM_PATH=/etc/polaris/gh-app.pem
-git config --global credential.helper "/usr/local/bin/git-credential-github-app" || true
+if [ -n "${GH_APP_PRIVATE_KEY_B64:-}" ]; then
+    printf '%s' "$GH_APP_PRIVATE_KEY_B64" | base64 -d > /etc/polaris/gh-app.pem \
+        || err "GH_APP_PRIVATE_KEY_B64 is not valid base64"
+    unset GH_APP_PRIVATE_KEY_B64
+elif [ -n "${GH_APP_PRIVATE_KEY_PEM:-}" ]; then
+    printf '%s' "$GH_APP_PRIVATE_KEY_PEM" > /etc/polaris/gh-app.pem
+    unset GH_APP_PRIVATE_KEY_PEM
+else
+    err "GH_APP_PRIVATE_KEY_B64 (base64 PEM) or GH_APP_PRIVATE_KEY_PEM required"
+fi
+chmod 0400 /etc/polaris/gh-app.pem
+
+# The helper (git-credential-github-app) sources this config.env.
+cat > /root/.config/github-app/config.env <<EOF
+APP_ID=${GH_APP_ID}
+INSTALLATION_ID=${GH_APP_INSTALLATION_ID}
+PRIVATE_KEY=/etc/polaris/gh-app.pem
+EOF
+chmod 0400 /root/.config/github-app/config.env
+git config --global credential.helper "/usr/local/bin/git-credential-github-app"
+# Also materialise /app/.git-credentials in the netrc-shaped form some skills
+# expect (https://x-access-token:<token>@github.com).
+if GH_TOKEN=$(python3 /opt/runner/mint_gh_app_token.py 2>/dev/null); then
+    export GH_TOKEN
+    umask 077
+    printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > /app/.git-credentials
+    chmod 0600 /app/.git-credentials
+else
+    echo "warn: GH App token mint failed at startup; the helper will retry on first git op" >&2
+fi
 
 # --- pull the skill bundle from mdx (specs/skill-bundle/v0.1) -----------
 export CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1
