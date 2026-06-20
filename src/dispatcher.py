@@ -25,6 +25,7 @@ _PASSTHROUGH_ENV = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
     "GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_PEM",
     "POLARIS_URL",
+    "IMPROVEMENT_LOOP_SKILL_ID", "IMPROVEMENT_LOOP_SKILL_VERSION",
 )
 
 
@@ -52,9 +53,9 @@ def build_docker_run_argv(cfg: RunnerConfig, *, name: str, target: str,
     argv = [
         "docker", "run", "--rm", "--name", name,
         "--network", cfg.network,
+        # the codegen sandbox spawns its own jailed containers via the host daemon
+        "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "-e", f"LOOP_TARGET={target}",
-        "-e", f"CLAUDE_MODEL={cfg.model}",
-        "-e", f"CLAUDE_MAX_TURNS={cfg.max_turns}",
     ]
     # the runner talks to the substrate as itself (its scoped token → POLARIS_TOKEN)
     skill_token = env.get(cfg.skill_token_env)
@@ -66,8 +67,10 @@ def build_docker_run_argv(cfg: RunnerConfig, *, name: str, target: str,
     for k, v in cfg.extra_env.items():
         argv += ["-e", f"{k}={v}"]
     argv += [cfg.runner_image]
-    # the skill invocation (claude runs the improvement-loop skill on the target)
-    argv += ["claude", "--print", cfg.skill_command.format(target=target)]
+    # the claude invocation the runner entrypoint exec's (runs the loop skill)
+    argv += ["claude", "--print", "--dangerously-skip-permissions",
+             "--max-turns", str(cfg.max_turns), "--model", cfg.model,
+             cfg.skill_command.format(target=target)]
     return argv
 
 
