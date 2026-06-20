@@ -1,0 +1,50 @@
+{
+  "name": "polaris-agent-improvement-loop",
+  "jsonversion": "4",
+  "servicetype": "extended",
+  "ge_domain": "polaris",
+  "description": "Event-driven improvement-loop shim. Subscribes to loop.run.requested on the polaris substrate, spawns ephemeral runner containers that run a self-improving loop (discover→synthesize→resolve→codegen→grounded/governed score) on the requested target. Concurrency-1; uses the substrate as a durable queue (defers when busy, dequeues via own emit history). Sibling of polaris-agent-cve-triage; the loop inherits the runner's LLM + GitHub App + substrate access instead of bringing its own.",
+  "metadata": {
+    "homepage": "https://github.com/Germanedge/polaris-agent-improvement-loop",
+    "build_source": "python",
+    "build_source_version": "3.12"
+  },
+  "keywords": ["polaris", "improvement-loop", "rsi", "shim", "event-driven", "python"],
+  "author": "Christoph Heuwieser <Christoph.Heuwieser@aptean.com>",
+  "contributors": [],
+  "repository": {
+    "type": "docker",
+    "url": "germanedge-docker.artifactory.new-solutions.com/edge-one/"
+  },
+  "dockerfile": "Dockerfile",
+  "version": "0.1.0",
+  "profiles": {
+    "production": {
+      "replicas": 1,
+      "containers": [
+        {
+          "configuration": {
+            "ports": [],
+            "volumes": [
+              {"name": "docker-sock", "hostPath": "/var/run/docker.sock", "mountPath": "/var/run/docker.sock"},
+              {"name": "shim-logs",   "hostPath": "/var/lib/improvement-loop-shim/logs", "mountPath": "/var/lib/improvement-loop-shim/logs"}
+            ],
+            "environments": [
+              {"name": "POLARIS_URL",            "value": "https://polaris-bot-mdx.k8s.myapp.de"},
+              {"name": "POLARIS_TOKEN",          "valueFrom": "secret:polaris-agent-improvement-loop-secret/polaris_token"},
+              {"name": "SKILL_POLARIS_TOKEN",    "valueFrom": "secret:polaris-agent-improvement-loop-secret/skill_polaris_token"},
+              {"name": "ANTHROPIC_API_KEY",      "valueFrom": "secret:polaris-agent-improvement-loop-secret/anthropic_api_key"},
+              {"name": "GH_APP_ID",              "valueFrom": "secret:polaris-agent-improvement-loop-secret/gh_app_id"},
+              {"name": "GH_APP_INSTALLATION_ID", "valueFrom": "secret:polaris-agent-improvement-loop-secret/gh_app_installation_id"},
+              {"name": "GH_APP_PRIVATE_KEY_PEM", "valueFrom": "secret:polaris-agent-improvement-loop-secret/gh_app_private_key_pem"},
+              {"name": "RUNNER_IMAGE",           "value": "edgeone-skill-runner:latest"},
+              {"name": "LOOP_MODEL",             "value": "claude-opus-4-8"},
+              {"name": "LOOP_TIMEOUT_MIN",       "value": "60"},
+              {"name": "LOOP_TRIGGER_EVENT",     "value": "loop.run.requested"}
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
