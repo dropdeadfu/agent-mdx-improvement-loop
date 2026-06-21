@@ -14,10 +14,25 @@ instead of a standalone process bringing its own.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("improvement-loop-shim.dispatcher")
+
+
+def _read_credentials_b64(path: str) -> str | None:
+    """Read a live credentials.json → base64, or None if absent/unreadable.
+
+    The fleet refreshes the OAuth credentials.json IN PLACE (a keepalive sidecar
+    renews the token well before its ~8h expiry). The shim therefore re-reads it
+    at every spawn so each runner gets a currently-valid token — forwarding the
+    blob captured once at the shim's own startup would 401 within hours."""
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except OSError:
+        return None
 
 # Env names passed straight through from the shim's environment to the runner
 # (the inherited access). Absent ones are simply skipped. Both credential
@@ -38,8 +53,9 @@ _PASSTHROUGH_ENV = (
 class RunnerConfig:
     runner_image: str = "edgeone-skill-runner:latest"
     # The command the runner runs. {target} is substituted with the loop target.
-    # Defaults to the improvement-loop skill (sibling of /e1:edgeone.cve-triage).
-    skill_command: str = "/e1:improvement-loop {target}"
+    # Sibling of /e1:edgeone.cve-triage — the command is /e1:<skill-dir>, i.e.
+    # /e1:edgeone.improvement-loop (the skill lives at skills/edgeone.improvement-loop).
+    skill_command: str = "/e1:edgeone.improvement-loop {target}"
     model: str = "claude-opus-4-8"
     max_turns: int = 200
     timeout_min: int = 60
@@ -47,6 +63,10 @@ class RunnerConfig:
     # The runner's own substrate token (read+emit for loop.* on its station).
     # Passed as POLARIS_TOKEN inside the runner; sourced from the shim env.
     skill_token_env: str = "SKILL_POLARIS_TOKEN"
+    # Live OAuth credentials.json path (mounted into the shim from the host the
+    # fleet keepalive refreshes). When set + present, re-read at each spawn and
+    # injected as a FRESH ANTHROPIC_CREDENTIALS_B64 (overrides any stale env one).
+    credentials_file: str = ""
     extra_env: dict = field(default_factory=dict)
 
 
@@ -66,9 +86,16 @@ def build_docker_run_argv(cfg: RunnerConfig, *, name: str, target: str,
     skill_token = env.get(cfg.skill_token_env)
     if skill_token:
         argv += ["-e", f"POLARIS_TOKEN={skill_token}"]
+    # fresh OAuth creds re-read at spawn (the env-captured blob goes stale); when
+    # present it supersedes the passthrough ANTHROPIC_CREDENTIALS_B64.
+    fresh_creds = _read_credentials_b64(cfg.credentials_file) if cfg.credentials_file else None
     for key in _PASSTHROUGH_ENV:
+        if key == "ANTHROPIC_CREDENTIALS_B64" and fresh_creds:
+            continue  # injected fresh below
         if env.get(key):
             argv += ["-e", f"{key}={env[key]}"]
+    if fresh_creds:
+        argv += ["-e", f"ANTHROPIC_CREDENTIALS_B64={fresh_creds}"]
     for k, v in cfg.extra_env.items():
         argv += ["-e", f"{k}={v}"]
     argv += [cfg.runner_image]

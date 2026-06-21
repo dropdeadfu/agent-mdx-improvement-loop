@@ -25,7 +25,7 @@ def test_runner_inherits_creds_and_invokes_the_skill_on_the_target():
     # target threaded + the skill invoked
     assert "LOOP_TARGET=skill:edgeone.cve-triage" in argv
     assert cfg.runner_image in argv
-    assert "/e1:improvement-loop skill:edgeone.cve-triage" in j
+    assert "/e1:edgeone.improvement-loop skill:edgeone.cve-triage" in j
 
 
 def test_absent_creds_are_skipped():
@@ -33,6 +33,27 @@ def test_absent_creds_are_skipped():
     argv = D.build_docker_run_argv(cfg, name="n", target="t", env={})
     assert not any("ANTHROPIC_API_KEY=" in a for a in argv)
     assert not any(a.startswith("POLARIS_TOKEN=") for a in argv)  # no skill token → none
+
+
+def test_fresh_credentials_reread_at_spawn_supersede_stale_env(tmp_path):
+    creds = tmp_path / "credentials.json"
+    creds.write_text('{"claudeAiOauth":{"accessToken":"FRESH"}}')
+    cfg = D.RunnerConfig(credentials_file=str(creds))
+    # the shim env carries a STALE blob captured at its own startup
+    env = {"ANTHROPIC_CREDENTIALS_B64": "U1RBTEU="}  # base64("STALE")
+    argv = D.build_docker_run_argv(cfg, name="n", target="t", env=env)
+    creds_args = [a for a in argv if a.startswith("ANTHROPIC_CREDENTIALS_B64=")]
+    assert len(creds_args) == 1, "exactly one creds env, the fresh one"
+    import base64
+    got = base64.b64decode(creds_args[0].split("=", 1)[1]).decode()
+    assert "FRESH" in got and "STALE" not in creds_args[0]
+
+
+def test_missing_credentials_file_falls_back_to_env_blob(tmp_path):
+    cfg = D.RunnerConfig(credentials_file=str(tmp_path / "absent.json"))
+    env = {"ANTHROPIC_CREDENTIALS_B64": "U1RBTEU="}
+    argv = D.build_docker_run_argv(cfg, name="n", target="t", env=env)
+    assert "ANTHROPIC_CREDENTIALS_B64=U1RBTEU=" in argv  # unreadable file → keep env
     assert "LOOP_TARGET=t" in argv and cfg.runner_image in argv
 
 

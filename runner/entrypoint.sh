@@ -121,7 +121,13 @@ echo "$MANIFEST" | python3 -c 'import sys,json; [print(f["path"]) for f in json.
         "${POLARIS_URL}/agent-skills/${SKILL_ID}/${RESOLVED}/${rel}" -o "$dest" \
         || err "bundle file fetch failed: ${rel}"
 done
-claude plugin marketplace add "$MP" 2>/dev/null || true
+# Adding the marketplace is not enough — the plugin must be INSTALLED for its
+# skills to register as /e1:<skill> commands in headless --print mode (this is
+# the step a marketplace-add-only entrypoint misses; mirrors cve-triage).
+if ! claude plugin list 2>/dev/null | grep -q "e1@germanedge-ai-plugins"; then
+    claude plugin marketplace add "$MP" 2>&1 | tail -3 || true
+    claude plugin install e1@germanedge-ai-plugins 2>&1 | tail -3 || true
+fi
 
 # --- exec the claude invocation the shim handed us ----------------------
 exec "$@"

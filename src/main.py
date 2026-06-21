@@ -164,6 +164,9 @@ async def run() -> int:  # pragma: no cover — the live loop (needs substrate+d
         runner_image=os.environ.get("RUNNER_IMAGE", "edgeone-skill-runner:latest"),
         model=os.environ.get("LOOP_MODEL", "claude-opus-4-8"),
         timeout_min=int(os.environ.get("LOOP_TIMEOUT_MIN", "60")),
+        # live OAuth credentials.json (mounted from the keepalive-refreshed host
+        # dir); re-read at each spawn so runners never get a stale token.
+        credentials_file=os.environ.get("CREDENTIALS_FILE", ""),
     )
     shim = Shim(client, cfg)
     sub = await client.create_subscription({
