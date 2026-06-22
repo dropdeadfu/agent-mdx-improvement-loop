@@ -62,10 +62,22 @@ def _ulid() -> str:
 
 def target_from_delta(delta: dict) -> str | None:
     """Extract the loop target from an SSE delta (handles {event:…} wrappers and
-    bare envelopes; subject.loop_target then payload.target)."""
+    bare envelopes; subject.loop_target then payload.target).
+
+    A cron-fired SCHEDULE delta carries no event/target — but its
+    `subscription_name` names the target (`env:<env>` or `process:<env>/<id>`).
+    Falling back to it is what lets a schedule subscription drive the loop
+    autonomously (the collector's cron_scheduler delivers these). The prefix guard
+    keeps event-triggered subs like `loop-run-requests` from matching."""
     ev = delta.get("event") if isinstance(delta.get("event"), dict) else delta
     subj = ev.get("subject") or {}
-    return subj.get("loop_target") or (ev.get("payload") or {}).get("target")
+    target = subj.get("loop_target") or (ev.get("payload") or {}).get("target")
+    if target:
+        return target
+    name = delta.get("subscription_name") or ""
+    if name.startswith(("env:", "process:")):
+        return name
+    return None
 
 
 def next_to_process(events: list[dict]) -> str | None:

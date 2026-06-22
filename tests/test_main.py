@@ -9,6 +9,17 @@ def test_target_from_delta_variants():
     assert M.target_from_delta({"subject": {"loop_target": "skill:y"}}) == "skill:y"     # bare
     assert M.target_from_delta({"payload": {"target": "skill:z"}}) == "skill:z"          # fallback
     assert M.target_from_delta({"subject": {}, "payload": {}}) is None
+    # a cron-fired schedule delta names its target via subscription_name → drives the loop
+    assert M.target_from_delta(
+        {"kind": "schedule", "subscription_name": "env:software-factory"}) == "env:software-factory"
+    assert M.target_from_delta(
+        {"kind": "schedule", "subscription_name": "process:software-factory/pr-review"}
+    ) == "process:software-factory/pr-review"
+    # event-triggered subs (e.g. loop-run-requests) must NOT match the prefix fallback
+    assert M.target_from_delta({"kind": "schedule", "subscription_name": "loop-run-requests"}) is None
+    # an event WITH a target still wins over the subscription_name fallback
+    assert M.target_from_delta(
+        {"subscription_name": "env:x", "event": {"subject": {"loop_target": "skill:real"}}}) == "skill:real"
 
 
 def test_next_to_process_dequeues_unsettled_deferrals_oldest_first():
