@@ -30,10 +30,12 @@ import time
 from datetime import datetime, timezone
 
 try:  # package context (deploy) / flat (tests)
-    from .dispatcher import RunnerConfig, RunningInvocation, is_wedged, kill_container, spawn_runner
+    from .dispatcher import (RunnerConfig, RunningInvocation, is_wedged, keepwarm_holder,
+                             kill_container, maybe_refresh_holder, spawn_runner)
     from .substrate_client import SubstrateClient, load_token
 except ImportError:  # pragma: no cover
-    from dispatcher import RunnerConfig, RunningInvocation, is_wedged, kill_container, spawn_runner
+    from dispatcher import (RunnerConfig, RunningInvocation, is_wedged, keepwarm_holder,
+                            kill_container, maybe_refresh_holder, spawn_runner)
     from substrate_client import SubstrateClient, load_token
 
 logger = logging.getLogger("improvement-loop-shim")
@@ -43,6 +45,12 @@ SHIM_PRODUCER = "loop:improvement-loop-shim"
 TRIGGER_EVENT = os.environ.get("LOOP_TRIGGER_EVENT", "loop.run.requested")
 HEARTBEAT_S = 60.0
 WATCHDOG_S = 60.0
+# Keep-warm: force-exercise the OAuth holder every interval so its refresh token
+# can't idle-lapse (~8h unused → 401). 0 disables. Startup delay lets the SSE
+# connect first. Interval = the JIT refresh band so a ping lands inside the
+# pre-expiry window each cycle (see dispatcher).
+KEEPWARM_INTERVAL_S = int(os.environ.get("LOOP_KEEPWARM_INTERVAL_S", "7200"))
+KEEPWARM_STARTUP_DELAY_S = int(os.environ.get("LOOP_KEEPWARM_STARTUP_DELAY_S", "120"))
 
 
 def _ts() -> str:
@@ -131,6 +139,18 @@ class Shim:
         await self._spawn(target)
 
     async def _spawn(self, target: str) -> None:
+        # JIT-refresh the holder's OAuth token if it's near expiry, so the runner
+        # gets a currently-valid credential. The holder persists the rotated token
+        # to its volume, which credentials_file (re-read in build_docker_run_argv)
+        # then picks up. Best-effort — never block a spawn on a refresh hiccup.
+        if self.cfg.holder_container:
+            try:
+                if await maybe_refresh_holder(self.cfg.holder_container,
+                                              self.cfg.credentials_file,
+                                              self.cfg.refresh_band_s):
+                    await asyncio.sleep(2.0)  # let claude-cli persist the rotation
+            except Exception as e:  # noqa: BLE001
+                logger.warning("JIT credential refresh failed (continuing): %s", e)
         name = f"loop-run-{int(time.time())}-{abs(hash(target)) % 100000}"
         self.current = await spawn_runner(self.cfg, name=name, target=target,
                                           env=dict(os.environ), now=time.time())
@@ -167,6 +187,36 @@ class Shim:
                 logger.warning("runner %s wedged past deadline — killing", inv.name)
                 await kill_container(inv.name)
 
+    async def keepwarm(self) -> None:
+        """Periodically force-exercise the OAuth holder so its refresh token can't
+        idle-lapse (the ~8h-unused → 401). Independent of trigger activity. Skips
+        while a runner is live (don't fight a spawn for the holder), and on a dead
+        refresh files an agent.needs_human for an operator re-login."""
+        if KEEPWARM_INTERVAL_S <= 0 or not self.cfg.holder_container:
+            logger.info("keep-warm disabled (interval<=0 or no holder_container)")
+            return
+        logger.info("keep-warm ON: holder=%s every %ds (first ping in %ds)",
+                    self.cfg.holder_container, KEEPWARM_INTERVAL_S, KEEPWARM_STARTUP_DELAY_S)
+        await asyncio.sleep(KEEPWARM_STARTUP_DELAY_S)
+        while True:
+            if self.current is None:
+                try:
+                    alive, detail = await keepwarm_holder(self.cfg.holder_container,
+                                                          self.cfg.credentials_file)
+                    logger.info("keep-warm holder=%s alive=%s detail=%s",
+                                self.cfg.holder_container, alive, detail)
+                    if not alive:
+                        await self._emit(
+                            "agent.needs_human", f"holder:{self.cfg.holder_container}",
+                            payload={"kind": "operator_action_required",
+                                     "summary": f"OAuth holder {self.cfg.holder_container} refresh "
+                                                "token is dead — interactive re-login needed",
+                                     "details": {"holder": self.cfg.holder_container, "detail": detail},
+                                     "emitting_producer": SHIM_PRODUCER})
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("keep-warm error (continuing): %s", e)
+            await asyncio.sleep(KEEPWARM_INTERVAL_S)
+
 
 async def run() -> int:  # pragma: no cover — the live loop (needs substrate+docker)
     logging.basicConfig(level=logging.INFO)
@@ -176,9 +226,12 @@ async def run() -> int:  # pragma: no cover — the live loop (needs substrate+d
         runner_image=os.environ.get("RUNNER_IMAGE", "edgeone-skill-runner:latest"),
         model=os.environ.get("LOOP_MODEL", "claude-opus-4-8"),
         timeout_min=int(os.environ.get("LOOP_TIMEOUT_MIN", "60")),
-        # live OAuth credentials.json (mounted from the keepalive-refreshed host
-        # dir); re-read at each spawn so runners never get a stale token.
+        # live OAuth credentials.json (mounted from the holder's volume); re-read
+        # at each spawn so runners never get a stale token.
         credentials_file=os.environ.get("CREDENTIALS_FILE", ""),
+        # the OAuth holder backing credentials_file — JIT-refreshed at spawn +
+        # kept warm on a timer (the cve-triage pattern).
+        holder_container=os.environ.get("LOOP_HOLDER_CONTAINER", ""),
     )
     shim = Shim(client, cfg)
     sub = await client.create_subscription({
@@ -191,6 +244,7 @@ async def run() -> int:  # pragma: no cover — the live loop (needs substrate+d
     await shim._emit("shim.heartbeat", "improvement-loop-shim",
                      payload={"status": "started", "trigger": TRIGGER_EVENT})
     asyncio.create_task(shim.watchdog())
+    asyncio.create_task(shim.keepwarm())
     async for line in client.sse_lines(owner):
         delta = client.parse_sse_event(line)
         if not delta:

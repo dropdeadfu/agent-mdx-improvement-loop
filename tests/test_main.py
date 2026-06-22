@@ -85,3 +85,64 @@ def test_idle_shim_spawns(monkeypatch):
     asyncio.run(drive())
     types = [e["event_type"] for e in client.emitted]
     assert "loop.run.accepted" in types
+
+
+# --- ported JIT-refresh + keepwarm (the cve-triage holder pattern) -----------
+import asyncio as _asyncio
+import json as _json
+
+
+def test_keepwarm_outcome_classifies_dead_alive_refreshed():
+    from dispatcher import keepwarm_outcome
+    # a 401-class marker in the holder output => refresh token dead
+    assert keepwarm_outcome("... 401 Invalid authentication ...", 100.0, 100.0) == (False, "dead_refresh")
+    assert keepwarm_outcome("invalid_grant", None, None)[0] is False
+    # clean output, expiry advanced => refreshed
+    assert keepwarm_outcome("ok", 100.0, 200.0) == (True, "refreshed")
+    # clean output, expiry unchanged => alive (still had life)
+    assert keepwarm_outcome("ok", 200.0, 200.0) == (True, "alive")
+
+
+def test_credentials_expires_epoch(tmp_path):
+    from dispatcher import _credentials_expires_epoch
+    f = tmp_path / "c.json"
+    f.write_text(_json.dumps({"claudeAiOauth": {"expiresAt": 1782000000000}}))
+    assert _credentials_expires_epoch(str(f)) == 1782000000.0
+    f.write_text("not json")
+    assert _credentials_expires_epoch(str(f)) is None
+    assert _credentials_expires_epoch(str(tmp_path / "missing.json")) is None
+
+
+def test_maybe_refresh_holder_band_gate(tmp_path, monkeypatch):
+    import dispatcher as D
+    f = tmp_path / "c.json"
+    pinged = []
+
+    async def fake_ping(container):
+        pinged.append(container); return "ok"
+    monkeypatch.setattr(D, "_ping_holder", fake_ping)
+
+    # token with 5h of life, 2h band => NO refresh
+    f.write_text(_json.dumps({"claudeAiOauth": {"expiresAt": int((1000 + 5 * 3600) * 1000)}}))
+    assert _asyncio.run(D.maybe_refresh_holder("holder", str(f), 7200, now=1000.0)) is False
+    assert pinged == []
+    # token with 1h of life, 2h band => refresh (ping the holder)
+    f.write_text(_json.dumps({"claudeAiOauth": {"expiresAt": int((1000 + 3600) * 1000)}}))
+    assert _asyncio.run(D.maybe_refresh_holder("holder", str(f), 7200, now=1000.0)) is True
+    assert pinged == ["holder"]
+    # no holder configured => never refresh
+    assert _asyncio.run(D.maybe_refresh_holder("", str(f), 7200, now=1000.0)) is False
+
+
+def test_keepwarm_holder_timeout_is_not_dead(tmp_path, monkeypatch):
+    import dispatcher as D
+    f = tmp_path / "c.json"
+    f.write_text(_json.dumps({"claudeAiOauth": {"expiresAt": 1782000000000}}))
+
+    async def fake_ping(container):
+        return "__ping_timeout__"
+    monkeypatch.setattr(D, "_ping_holder", fake_ping)
+    alive, detail = _asyncio.run(D.keepwarm_holder("holder", str(f)))
+    assert alive is True and detail.startswith("ping_unavailable")
+    # no holder => skip
+    assert _asyncio.run(D.keepwarm_holder("", str(f))) == (True, "skip:no_holder")

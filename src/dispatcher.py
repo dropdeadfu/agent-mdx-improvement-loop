@@ -15,10 +15,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("improvement-loop-shim.dispatcher")
+
+# Substrings in the holder's claude-cli output that mean the refresh token itself
+# is dead (interactive re-auth needed) — distinct from a transient/network blip.
+_DEAD_REFRESH_MARKERS = ("401", "Invalid authentication", "invalid_grant", "OAuth")
+# JIT-refresh band: if the OAuth token expires within this many seconds at spawn
+# time, ping the holder's claude-cli to roll it forward. 7200s = 2h (tokens ~8h).
+DEFAULT_REFRESH_BAND_S = int(os.environ.get("LOOP_REFRESH_BAND_S", "7200"))
+KEEPWARM_PING_TIMEOUT_S = int(os.environ.get("LOOP_KEEPWARM_PING_TIMEOUT_S", "120"))
 
 
 def _read_credentials_b64(path: str) -> str | None:
@@ -33,6 +44,85 @@ def _read_credentials_b64(path: str) -> str | None:
             return base64.b64encode(f.read()).decode("ascii")
     except OSError:
         return None
+
+
+# --- OAuth holder JIT-refresh + keep-warm (ported from polaris-agent-cve-triage)
+# The holder's OAuth refresh token dies after ~8h UNUSED (idle-lapse), not from
+# use — claude-cli self-refreshes it whenever exercised. So we (1) JIT-refresh at
+# spawn if the token is within its refresh band of expiry, and (2) keep-warm on a
+# timer to roll the refresh forward inside the idle window.
+
+def _credentials_expires_epoch(path: str) -> float | None:
+    """Parse claudeAiOauth.expiresAt (epoch seconds) from the creds file, or None."""
+    try:
+        with open(path, "rb") as f:
+            doc = json.loads(f.read().decode("utf-8"))
+        exp_ms = (doc.get("claudeAiOauth") or {}).get("expiresAt")
+        if isinstance(exp_ms, (int, float)) and exp_ms > 0:
+            return float(exp_ms) / 1000.0
+    except (OSError, ValueError, UnicodeDecodeError, AttributeError):
+        return None
+    return None
+
+
+async def _ping_holder(container: str) -> str:
+    """Trivial Haiku invocation inside the holder — forces the OAuth flow to
+    refresh + persist a new token if expiry is near. Returns the cli output (for
+    dead-refresh classification) or a sentinel on timeout/error."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container,
+            "claude", "-p", "reply with: ok", "--model", "claude-haiku-4-5",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=KEEPWARM_PING_TIMEOUT_S)
+        return (out or b"").decode("utf-8", "replace")
+    except asyncio.TimeoutError:
+        return "__ping_timeout__"
+    except Exception as e:  # noqa: BLE001 — docker hiccup, not a creds verdict
+        return f"__ping_error__:{type(e).__name__}"
+
+
+async def maybe_refresh_holder(container: str, credentials_file: str,
+                               refresh_band_s: int, now: float | None = None) -> bool:
+    """JIT refresh: if the holder's OAuth token expires within refresh_band_s, exec
+    claude-cli in the holder to roll it forward (it persists to the holder volume,
+    which credentials_file reads). Returns True iff a refresh was attempted (caller
+    re-reads the file either way). No-op when no holder or plenty of life left."""
+    if not container or not credentials_file:
+        return False
+    exp = _credentials_expires_epoch(credentials_file)
+    if exp is None:
+        return False
+    now = now if now is not None else time.time()
+    if exp - now >= refresh_band_s:
+        return False  # plenty of life — skip
+    await _ping_holder(container)
+    return True
+
+
+def keepwarm_outcome(output_text: str, before_exp: float | None,
+                     after_exp: float | None) -> tuple[bool, str]:
+    """Pure: classify a keep-warm ping. alive=False ⇒ refresh token dead (401-class
+    marker) → needs re-auth. alive=True: 'refreshed' if expiry advanced, else 'alive'."""
+    if any(m in output_text for m in _DEAD_REFRESH_MARKERS):
+        return False, "dead_refresh"
+    moved = (before_exp is not None and after_exp is not None and after_exp > before_exp)
+    return True, ("refreshed" if moved else "alive")
+
+
+async def keepwarm_holder(container: str, credentials_file: str) -> tuple[bool, str]:
+    """Unconditionally exercise the holder's refresh token (beat the ~8h idle-lapse),
+    then report (alive, detail). A timeout/error is treated as NOT-dead (transient),
+    so only an explicit 401-class marker raises a re-auth signal."""
+    if not container:
+        return True, "skip:no_holder"
+    before = _credentials_expires_epoch(credentials_file)
+    text = await _ping_holder(container)
+    if text.startswith("__ping_timeout__") or text.startswith("__ping_error__"):
+        return True, "ping_unavailable:" + text.strip("_")
+    after = _credentials_expires_epoch(credentials_file)
+    return keepwarm_outcome(text, before, after)
 
 # Env names passed straight through from the shim's environment to the runner
 # (the inherited access). Absent ones are simply skipped. Both credential
@@ -63,10 +153,16 @@ class RunnerConfig:
     # The runner's own substrate token (read+emit for loop.* on its station).
     # Passed as POLARIS_TOKEN inside the runner; sourced from the shim env.
     skill_token_env: str = "SKILL_POLARIS_TOKEN"
-    # Live OAuth credentials.json path (mounted into the shim from the host the
-    # fleet keepalive refreshes). When set + present, re-read at each spawn and
-    # injected as a FRESH ANTHROPIC_CREDENTIALS_B64 (overrides any stale env one).
+    # Live OAuth credentials.json path (mounted into the shim from the holder's
+    # volume). When set + present, re-read at each spawn and injected as a FRESH
+    # ANTHROPIC_CREDENTIALS_B64 (overrides any stale env one).
     credentials_file: str = ""
+    # The OAuth holder container backing credentials_file. When set, the shim
+    # JIT-refreshes the token (exec claude-cli in the holder if near expiry) at
+    # each spawn + keep-warms it on a timer — the cve-triage pattern, so the token
+    # never goes stale/idle-lapses regardless of the holder's own keepalive.
+    holder_container: str = ""
+    refresh_band_s: int = DEFAULT_REFRESH_BAND_S
     extra_env: dict = field(default_factory=dict)
 
 
